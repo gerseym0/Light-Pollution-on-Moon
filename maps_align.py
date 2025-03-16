@@ -1,230 +1,113 @@
-import os
-import math
-import logging
+import rasterio
+from rasterio.windows import Window
+from rasterio.vrt import WarpedVRT
+from rasterio.warp import Resampling
 import numpy as np
-from osgeo import gdal, osr
-from multiprocessing import Pool, cpu_count
 
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
+# Paths to input files (specify your own paths)
+elevation_path = r'C:\Users\Ildar\Desktop\Moonpol\data prep\test2\elevation200m.tif'   # Elevation map
+slopes_path = r'C:\Users\Ildar\Desktop\Moonpol\data prep\test2\slope200m.tif'         # Slope map
+minerals_path = r'C:\Users\Ildar\Desktop\Moonpol\data prep\test2\mineral200m.tif'      # Mineral map
 
-class LunarRasterProcessor:
-    def __init__(self, reference_path=None, target_res=200):
-        """
-        Если задан reference_path, используем его геотрансформацию и проекцию в качестве эталона.
-        """
-        self.target_res = target_res
-        if reference_path:
-            ds_ref = gdal.Open(reference_path)
-            if ds_ref is None:
-                raise ValueError(f"Не удалось открыть референсный файл: {reference_path}")
-            self.ref_gt = ds_ref.GetGeoTransform()
-            self.ref_proj = ds_ref.GetProjection()
-            self.ref_size = (ds_ref.RasterXSize, ds_ref.RasterYSize)
-            ds_ref = None
-        else:
-            # Если reference_path не задан, создаём глобальную сетку на основе луны
-            self.ref_gt = (-100.0, target_res, 0, 2729300.0, 0, -target_res)
-            self.ref_proj = self._create_projection()
-            # Вычисляем размер из геотрансформации и bounds (примерно)
-            self.ref_size = (54583, 27293)
+# Paths to output files
+elevation_aligned_path = r'C:\Users\Ildar\Desktop\Moonpol\data prep\test2\elevation_align.tif'
+slopes_aligned_path = r'C:\Users\Ildar\Desktop\Moonpol\data prep\test2\slope_align.tif'
+minerals_aligned_path = r'C:\Users\Ildar\Desktop\Moonpol\data prep\test2\mineral_align.tif'
 
-    def _create_projection(self):
-        """Создает WKT для Equirectangular Moon с нулевыми смещениями"""
-        wkt = '''
-        PROJCS["Moon_Equirectangular",
-            GEOGCS["GCS_Moon",
-                DATUM["D_Moon",
-                    SPHEROID["Moon",1737400,0]],
-            PRIMEM["Reference_Meridian",0],
-            UNIT["degree",0.0174532925199433]],
-        PROJECTION["Equirectangular"],
-        PARAMETER["standard_parallel_1",0],
-        PARAMETER["central_meridian",0],
-        PARAMETER["false_easting",0],
-        PARAMETER["false_northing",0],
-        UNIT["metre",1]]
-        '''
-        return wkt.strip()
+# Target projection: Moon Equirectangular (WKT)
+target_crs = (
+    'PROJCS["Equirectangular Moon",'
+    'GEOGCS["GCS_Moon",'
+    'DATUM["D_Moon",'
+    'SPHEROID["Moon_localRadius",1737400,0]],'
+    'PRIMEM["Reference_Meridian",0],'
+    'UNIT["degree",0.0174532925199433,AUTHORITY["EPSG","9122"]]],'
+    'PROJECTION["Equirectangular"],'
+    'PARAMETER["standard_parallel_1",0],'
+    'PARAMETER["central_meridian",0],'
+    'PARAMETER["false_easting",0],'
+    'PARAMETER["false_northing",0],'
+    'UNIT["metre",1,AUTHORITY["EPSG","9001"]],'
+    'AXIS["Easting",EAST],'
+    'AXIS["Northing",NORTH]]'
+)
 
-    def create_tile_grid(self, tile_size=4096):
-        tiles = []
-        full_size_x, full_size_y = self.ref_size
-        num_tiles_x = math.ceil(full_size_x / tile_size)
-        num_tiles_y = math.ceil(full_size_y / tile_size)
+# Determine the shift for elevation and slope maps:
+# To shift by the meridian, we split the image horizontally (by the number of columns)
+with rasterio.open(elevation_path) as elev_src:
+    width = elev_src.width
+    # shift_pixels is the number of pixels to shift (half the width)
+    shift_pixels = width // 2
+    # Get the original geotransform and pixel size (assumes square pixel of 200 m)
+    orig_transform = elev_src.transform
+    pixel_size = orig_transform.a  # Pixel size in X (200 m)
+    # Compute the new geotransform: shift in X by shift_pixels * pixel_size
+    new_transform = orig_transform * rasterio.Affine.translation(-shift_pixels, 0)
+
+print(f"Calculated shift_pixels = {shift_pixels} and new geotransform for shifting.")
+
+# Function to shift (roll) the raster horizontally in blocks (tiles)
+def shift_raster(src_path, dst_path, shift_pixels, block_size=1024):
+    with rasterio.open(src_path) as src:
+        profile = src.profile.copy()
+        # Update the geotransform: apply horizontal shift in X
+        profile.update(transform=src.transform * rasterio.Affine.translation(-shift_pixels, 0))
         
-        for ty in range(num_tiles_y):
-            for tx in range(num_tiles_x):
-                xoff = tx * tile_size
-                yoff = ty * tile_size
-                xsize = min(tile_size, full_size_x - xoff)
-                ysize = min(tile_size, full_size_y - yoff)
-                
-                # Вычисляем bounds на основе референсной геотрансформации
-                gt = self.ref_gt
-                min_x = gt[0] + xoff * gt[1]
-                max_y = gt[3] + yoff * gt[5]  # gt[5] отрицательный
-                
-                bounds = [
-                    min_x,
-                    max_y + ysize * abs(gt[5]),
-                    min_x + xsize * gt[1],
-                    max_y
-                ]
-                tile = {
-                    'tx': tx,
-                    'ty': ty,
-                    'xoff': xoff,
-                    'yoff': yoff,
-                    'xsize': xsize,
-                    'ysize': ysize,
-                    'bounds': bounds,
-                    'geotransform': (
-                        min_x, gt[1], 0, max_y, 0, gt[5]
-                    ),
-                    'projection_wkt': self.ref_proj
-                }
-                tiles.append(tile)
-        return tiles
+        with rasterio.open(dst_path, 'w', **profile) as dst:
+            # Process the image in blocks (by rows)
+            for row in range(0, src.height, block_size):
+                num_rows = min(block_size, src.height - row)
+                window = Window(col_off=0, row_off=row, width=src.width, height=num_rows)
+                data = src.read(window=window)
+                # np.roll shifts data along axis=2 (columns)
+                data_shifted = np.roll(data, shift=shift_pixels, axis=2)
+                dst.write(data_shifted, window=window)
+    print(f"Finished shifting raster: {src_path} -> {dst_path}")
 
-    def process_dataset(self, in_path, out_path, resample_alg=gdal.GRA_NearestNeighbour, tile_size=4096):
-        """Обрабатывает входной растр, приводя его к референсной геометрии и проекции"""
-        tiles = self.create_tile_grid(tile_size)
-        temp_dir = os.path.join(os.path.dirname(out_path), 'tiles')
-        os.makedirs(temp_dir, exist_ok=True)
+# Shift elevation and slope maps
+print("Starting to shift elevation map...")
+shift_raster(elevation_path, elevation_aligned_path, shift_pixels, block_size=1024)
+print("Elevation map shifted and saved.\n")
 
-        tasks = []
-        for tile in tiles:
-            tile_path = os.path.join(
-                temp_dir,
-                f"{os.path.basename(out_path)}_tile_{tile['tx']}_{tile['ty']}.tif"
-            )
-            tasks.append((in_path, tile_path, tile, resample_alg, self.ref_proj))
+print("Starting to shift slope map...")
+shift_raster(slopes_path, slopes_aligned_path, shift_pixels, block_size=1024)
+print("Slope map shifted and saved.\n")
 
-        with Pool(cpu_count(), initializer=self._init_worker) as pool:
-            results = pool.map(self._process_tile, tasks)
+# For the mineral map, we need to reproject it to the target projection and match the dimensions and transform
+# of the aligned elevation/slope maps.
+# We use WarpedVRT for tiled processing.
+def reproject_raster(src_path, dst_path, target_crs, target_transform, target_width, target_height, block_size=1024):
+    with rasterio.open(src_path) as src:
+        profile = src.profile.copy()
+        profile.update({
+            'crs': target_crs,
+            'transform': target_transform,
+            'width': target_width,
+            'height': target_height
+        })
+        with rasterio.open(dst_path, 'w', **profile) as dst:
+            with WarpedVRT(src,
+                           crs=target_crs,
+                           transform=target_transform,
+                           width=target_width,
+                           height=target_height,
+                           resampling=Resampling.nearest) as vrt:
+                for row in range(0, target_height, block_size):
+                    num_rows = min(block_size, target_height - row)
+                    window = Window(0, row, target_width, num_rows)
+                    data = vrt.read(window=window)
+                    dst.write(data, window=window)
+    print(f"Finished reprojecting raster: {src_path} -> {dst_path}")
 
-        # Фильтруем успешно обработанные тайлы
-        valid_tiles = [r[0] for r in results if r[1]]
-        if not valid_tiles:
-            raise RuntimeError("Ни один из тайлов не обработался корректно.")
+# For the mineral map, use parameters from the aligned elevation map
+with rasterio.open(elevation_aligned_path) as aligned_elev:
+    target_transform = aligned_elev.transform
+    target_width = aligned_elev.width
+    target_height = aligned_elev.height
 
-        vrt_path = out_path + '.vrt'
-        vrt = gdal.BuildVRT(vrt_path, valid_tiles)
-        vrt.FlushCache()
+print("Starting to reproject mineral map...")
+# Reproject the mineral map
+reproject_raster(minerals_path, minerals_aligned_path, target_crs, target_transform, target_width, target_height, block_size=1024)
+print("Mineral map reprojected and saved.\n")
 
-        gdal.Translate(out_path, vrt_path,
-                       creationOptions=['COMPRESS=LZW', 'TILED=YES', 'BIGTIFF=IF_SAFER'])
-        os.remove(vrt_path)
-        return out_path
-
-    @staticmethod
-    def _init_worker():
-        gdal.AllRegister()
-
-    @staticmethod
-    def _process_tile(args):
-        in_path, out_path, tile, resample_alg, proj_wkt = args
-        try:
-            ds = gdal.Warp('', in_path,
-                           format='MEM',
-                           outputBounds=tile['bounds'],
-                           xRes=tile['geotransform'][1],
-                           yRes=abs(tile['geotransform'][5]),
-                           dstSRS=proj_wkt,
-                           resampleAlg=resample_alg)
-            if ds is None:
-                raise RuntimeError("gdal.Warp вернул None")
-            
-            driver = gdal.GetDriverByName('GTiff')
-            tile_ds = driver.Create(
-                out_path, 
-                tile['xsize'], 
-                tile['ysize'], 
-                ds.RasterCount,
-                ds.GetRasterBand(1).DataType,
-                options=['COMPRESS=LZW', 'TILED=YES']
-            )
-            tile_ds.SetGeoTransform(tile['geotransform'])
-            tile_ds.SetProjection(proj_wkt)
-            
-            for b in range(ds.RasterCount):
-                arr = ds.GetRasterBand(b+1).ReadAsArray()
-                tile_ds.GetRasterBand(b+1).WriteArray(arr)
-            
-            tile_ds.FlushCache()
-            tile_ds = None
-            ds = None
-            return (out_path, True)
-        except Exception as e:
-            logging.error(f"Tile error {out_path}: {str(e)}")
-            return (out_path, False)
-
-    def verify_alignment(self, raster_paths):
-        params = []
-        for path in raster_paths:
-            ds = gdal.Open(path)
-            params.append({
-                'size': (ds.RasterXSize, ds.RasterYSize),
-                'gt': ds.GetGeoTransform(),
-                'proj': ds.GetProjection()
-            })
-            ds = None
-        
-        base = params[0]
-        for i, p in enumerate(params[1:]):
-            if p['size'] != base['size']:
-                raise ValueError(f"Size mismatch: {raster_paths[0]} vs {raster_paths[i+1]}")
-            if not np.allclose(p['gt'], base['gt'], atol=1e-6):
-                raise ValueError(f"Geotransform mismatch: {raster_paths[0]} vs {raster_paths[i+1]}")
-            if p['proj'] != base['proj']:
-                raise ValueError(f"Projection mismatch: {raster_paths[0]} vs {raster_paths[i+1]}")
-        
-        logging.info("All rasters aligned perfectly!")
-
-if __name__ == "__main__":
-    # Используем карту высот в качестве референсной для выравнивания
-    ref_file = r'C:\Users\Ildar\Desktop\Moonpol\data prep\test2\elevation200m.tif'
-    config = {
-        'datasets': [
-            {
-                'type': 'elevation',
-                'input': ref_file,
-                'output': r'C:\Users\Ildar\Desktop\Moonpol\data prep\test2\aligned_elevation.tif',
-                'resample': gdal.GRA_NearestNeighbour
-            },
-            {
-                'type': 'minerals',
-                'input': r'C:\Users\Ildar\Desktop\Moonpol\data prep\test2\mineral200m.tif',
-                'output': r'C:\Users\Ildar\Desktop\Moonpol\data prep\test2\aligned_mineral.tif',
-                'resample': gdal.GRA_NearestNeighbour
-            },
-            {
-                'type': 'slope',
-                'input': r'C:\Users\Ildar\Desktop\Moonpol\data prep\test2\slope200m.tif',
-                'output': r'C:\Users\Ildar\Desktop\Moonpol\data prep\test2\aligned_slope.tif',
-                'resample': gdal.GRA_NearestNeighbour
-            }
-        ],
-        'tile_size': 4096
-    }
-
-    processor = LunarRasterProcessor(reference_path=ref_file)
-
-    try:
-        processed_files = []
-        for dataset in config['datasets']:
-            logging.info(f"Processing {dataset['type']}...")
-            result = processor.process_dataset(
-                dataset['input'],
-                dataset['output'],
-                dataset['resample'],
-                config['tile_size']
-            )
-            processed_files.append(result)
-        
-        processor.verify_alignment(processed_files)
-        logging.info("All datasets processed successfully!")
-
-    except Exception as e:
-        logging.error(f"Processing failed: {str(e)}")
+print("Processing complete. Aligned files have been saved.")
